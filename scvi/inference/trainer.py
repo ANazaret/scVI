@@ -24,25 +24,26 @@ logger = logging.getLogger(__name__)
 
 
 class Trainer:
-    r"""The abstract Trainer class for training a PyTorch model and monitoring its statistics. It should be
-    inherited at least with a .loss() function to be optimized in the training loop.
+    """The abstract Trainer class for training a PyTorch model and monitoring its statistics.
 
-    Args:
-        :model: A model instance from class ``VAE``, ``VAEC``, ``SCANVI``
-        :gene_dataset: A gene_dataset instance like ``CortexDataset()``
-        :use_cuda: Default: ``True``.
-        :metrics_to_monitor: A list of the metrics to monitor. If not specified, will use the
-            ``default_metrics_to_monitor`` as specified in each . Default: ``None``.
-        :benchmark: if True, prevents statistics computation in the training. Default: ``False``.
-        :frequency: The frequency at which to keep track of statistics. Default: ``None``.
-        :early_stopping_metric: The statistics on which to perform early stopping. Default: ``None``.
-        :save_best_state_metric:  The statistics on which we keep the network weights achieving the best store, and
-            restore them at the end of training. Default: ``None``.
-        :on: The data_loader name reference for the ``early_stopping_metric`` and ``save_best_state_metric``, that
-            should be specified if any of them is. Default: ``None``.
-        :show_progbar: If False, disables progress bar.
-        :seed: Random seed for train/test/validate split
+    It should be inherited at least with a ``.loss()`` function to be optimized in the training loop.
+
+    :param model: A model instance from class ``VAE``, ``VAEC``, ``SCANVI``
+    :param gene_dataset: A gene_dataset instance like ``CortexDataset()``
+    :param use_cuda: Default: ``True``.
+    :param metrics_to_monitor: A list of the metrics to monitor. If not specified, will use the
+        ``default_metrics_to_monitor`` as specified in each . Default: ``None``.
+    :param benchmark: if True, prevents statistics computation in the training. Default: ``False``.
+    :param frequency: The frequency at which to keep track of statistics. Default: ``None``.
+    :param early_stopping_metric: The statistics on which to perform early stopping. Default: ``None``.
+    :param save_best_state_metric:  The statistics on which we keep the network weights achieving the best store, and
+        restore them at the end of training. Default: ``None``.
+    :param on: The data_loader name reference for the ``early_stopping_metric`` and ``save_best_state_metric``, that
+        should be specified if any of them is. Default: ``None``.
+    :param show_progbar: If False, disables progress bar.
+    :param seed: Random seed for train/test/validate split
     """
+
     default_metrics_to_monitor = []
 
     def __init__(
@@ -141,16 +142,19 @@ class Trainer:
                 self.model.train()
         self.compute_metrics_time += time.time() - begin
 
-    def train(self, n_epochs=20, lr=1e-3, eps=0.01, params=None):
+    def train(self, n_epochs=400, lr=1e-3, eps=0.01, params=None, **extras_kwargs):
         begin = time.time()
         self.model.train()
 
         if params is None:
             params = filter(lambda p: p.requires_grad, self.model.parameters())
 
-        optimizer = self.optimizer = torch.optim.Adam(
+        self.optimizer = torch.optim.Adam(
             params, lr=lr, eps=eps, weight_decay=self.weight_decay
         )
+
+        # Initialization of other model's optimizers
+        self.training_extras_init(**extras_kwargs)
 
         self.compute_metrics_time = 0
         self.n_epochs = n_epochs
@@ -168,12 +172,13 @@ class Trainer:
             for tensors_list in self.data_loaders_loop():
                 if tensors_list[0][0].shape[0] < 3:
                     continue
-                self.current_loss = loss = self.loss(*tensors_list)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                self.on_iteration_begin()
+                # Update the model's parameters after seeing the data
+                self.on_training_loop(tensors_list)
+                # Checks the training status, ensures no nan loss
                 self.on_iteration_end()
 
+            # Computes metrics and controls early stopping
             if not self.on_epoch_end():
                 break
 
@@ -182,6 +187,8 @@ class Trainer:
             self.compute_metrics()
 
         self.model.eval()
+        self.training_extras_end()
+
         self.training_time += (time.time() - begin) - self.compute_metrics_time
         if self.frequency:
             logger.debug(
@@ -190,10 +197,27 @@ class Trainer:
             )
         self.on_training_end()
 
+    def on_training_loop(self, tensors_list):
+        self.current_loss = loss = self.loss(*tensors_list)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+    def training_extras_init(self, **extras_kwargs):
+        """Other necessary models to simultaneously train
+        """
+        pass
+
+    def training_extras_end(self):
+        """Place to put extra models in eval mode, etc.
+        """
+        pass
+
     def on_training_begin(self):
         pass
 
     def on_epoch_begin(self):
+        # Epochs refer to a pass through the entire dataset (in minibatches)
         pass
 
     def on_epoch_end(self):
@@ -221,6 +245,7 @@ class Trainer:
         return continue_training
 
     def on_iteration_begin(self):
+        # Iterations refer to minibatches
         pass
 
     def on_iteration_end(self):
@@ -231,11 +256,12 @@ class Trainer:
         pass
 
     def check_training_status(self):
-        """
-        Checks if loss is admissible. If not, training is stopped after max_nans consecutive
-        inadmissible loss
-        loss corresponds to the training loss of the model
-        max_nans is the maximum number of consecutive NaNs after which a ValueError will be
+        """Checks if loss is admissible.
+
+        If not, training is stopped after max_nans consecutive inadmissible loss
+        loss corresponds to the training loss of the model.
+
+        `max_nans` is the maximum number of consecutive NaNs after which a ValueError will be
         raised
         """
         loss_is_nan = torch.isnan(self.current_loss).item()
@@ -259,7 +285,8 @@ class Trainer:
         pass
 
     def data_loaders_loop(self):
-        """returns an zipped iterable corresponding to loss signature"""
+        """returns an zipped iterable corresponding to loss signature
+        """
         data_loaders_loop = [self._posteriors[name] for name in self.posteriors_loop]
         return zip(
             data_loaders_loop[0],
@@ -311,11 +338,12 @@ class Trainer:
         type_class=Posterior,
     ):
         """Creates posteriors ``train_set``, ``test_set``, ``validation_set``.
-            If ``train_size + test_size < 1`` then ``validation_set`` is non-empty.
 
-            :param train_size: float, int, or None (default is 0.1)
-            :param test_size: float, int, or None (default is None)
-            """
+        If ``train_size + test_size < 1`` then ``validation_set`` is non-empty.
+
+        :param train_size: float, int, or None (default is 0.1)
+        :param test_size: float, int, or None (default is None)
+        """
         model = self.model if model is None and hasattr(self, "model") else model
         gene_dataset = (
             self.gene_dataset

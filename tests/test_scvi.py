@@ -1,6 +1,16 @@
 import numpy as np
+import tempfile
+import os
 
-from scvi.dataset import CortexDataset, SyntheticDataset, GeneExpressionDataset
+from anndata import AnnData
+
+from scvi.dataset import (
+    AnnDatasetFromAnnData,
+    CortexDataset,
+    SyntheticDataset,
+    GeneExpressionDataset,
+    Dataset10X,
+)
 from scvi.inference import (
     JointSemiSupervisedTrainer,
     AlternateSemiSupervisedTrainer,
@@ -8,8 +18,9 @@ from scvi.inference import (
     UnsupervisedTrainer,
     AdapterTrainer,
     TotalTrainer,
+    TotalPosterior,
 )
-from scvi.inference.posterior import unsupervised_clustering_accuracy
+from scvi.inference.posterior import unsupervised_clustering_accuracy, load_posterior
 from scvi.inference.annotation import compute_accuracy_rf, compute_accuracy_svc
 from scvi.models import VAE, SCANVI, VAEC, LDVAE, TOTALVI, AutoZIVAE
 from scvi.models.classifier import Classifier
@@ -28,6 +39,12 @@ def test_cortex(save_path):
     trainer_cortex_vae.train(n_epochs=1)
     trainer_cortex_vae.train_set.reconstruction_error()
     trainer_cortex_vae.train_set.differential_expression_stats()
+    trainer_cortex_vae.train_set.generate_feature_correlation_matrix(
+        n_samples=2, correlation_type="pearson"
+    )
+    trainer_cortex_vae.train_set.generate_feature_correlation_matrix(
+        n_samples=2, correlation_type="spearman"
+    )
     trainer_cortex_vae.train_set.imputation(n_samples=1)
     trainer_cortex_vae.test_set.imputation(n_samples=5)
 
@@ -39,6 +56,26 @@ def test_cortex(save_path):
     trainer_cortex_vae.train_set.imputation_benchmark(
         n_samples=1, show_plot=False, title_plot="imputation", save_path=save_path
     )
+    trainer_cortex_vae.train_set.generate_parameters()
+
+    n_cells, n_genes = (
+        len(trainer_cortex_vae.train_set.indices),
+        cortex_dataset.nb_genes,
+    )
+    n_samples = 3
+    (dropout, means, dispersions,) = trainer_cortex_vae.train_set.generate_parameters()
+    assert dropout.shape == (n_cells, n_genes) and means.shape == (n_cells, n_genes)
+    assert dispersions.shape == (n_cells, n_genes)
+    (dropout, means, dispersions,) = trainer_cortex_vae.train_set.generate_parameters(
+        n_samples=n_samples
+    )
+    assert dropout.shape == (n_samples, n_cells, n_genes)
+    assert means.shape == (n_samples, n_cells, n_genes,)
+    (dropout, means, dispersions,) = trainer_cortex_vae.train_set.generate_parameters(
+        n_samples=n_samples, give_mean=True
+    )
+    assert dropout.shape == (n_cells, n_genes) and means.shape == (n_cells, n_genes)
+
     full = trainer_cortex_vae.create_posterior(
         vae, cortex_dataset, indices=np.arange(len(cortex_dataset))
     )
@@ -175,7 +212,9 @@ def totalvi_benchmark(dataset, n_epochs, use_cuda=True):
     totalvae = TOTALVI(
         dataset.nb_genes, len(dataset.protein_names), n_batch=dataset.n_batches
     )
-    trainer = TotalTrainer(totalvae, dataset, train_size=0.5, use_cuda=use_cuda)
+    trainer = TotalTrainer(
+        totalvae, dataset, train_size=0.5, use_cuda=use_cuda, early_stopping_kwargs=None
+    )
     trainer.train(n_epochs=n_epochs)
     trainer.test_set.reconstruction_error()
     trainer.test_set.marginal_ll()
@@ -184,8 +223,13 @@ def totalvi_benchmark(dataset, n_epochs, use_cuda=True):
     trainer.test_set.get_latent()
     trainer.test_set.generate()
     trainer.test_set.get_sample_dropout()
-    trainer.test_set.get_normalized_denoised_expression()
+    trainer.test_set.get_normalized_denoised_expression(transform_batch=0)
+    trainer.test_set.get_normalized_denoised_expression(transform_batch=0)
     trainer.test_set.imputation()
+    trainer.test_set.get_protein_mean()
+    trainer.test_set.one_vs_all_degenes(n_samples=2, M_permutation=10)
+    trainer.test_set.generate_feature_correlation_matrix(n_samples=2)
+    trainer.test_set.generate_feature_correlation_matrix(n_samples=2, transform_batch=0)
 
     return trainer
 
@@ -315,6 +359,14 @@ def test_differential_expression(save_path):
     trainer.train(n_epochs=2)
     post = trainer.create_posterior(vae, dataset, shuffle=False, indices=all_indices)
 
+    with tempfile.TemporaryDirectory() as temp_dir:
+        posterior_save_path = os.path.join(temp_dir, "posterior_data")
+        post.save_posterior(posterior_save_path)
+        new_vae = VAE(dataset.nb_genes, dataset.n_batches)
+        new_post = load_posterior(posterior_save_path, model=new_vae, use_cuda=False)
+    assert np.array_equal(new_post.indices, post.indices)
+    assert np.array_equal(new_post.gene_dataset.X, post.gene_dataset.X)
+
     # Sample scale example
     px_scales = post.scale_sampler(
         n_samples_per_cell=4, n_samples=None, selection=all_indices
@@ -342,6 +394,7 @@ def test_differential_expression(save_path):
         mode="change",
         use_permutation=True,
         M_permutation=100,
+        cred_interval_lvls=[0.5, 0.95],
     )
     print(de_dataframe.keys())
     assert (
@@ -357,12 +410,64 @@ def test_differential_expression(save_path):
     de_probabilities = de_dataframe.loc[:, "proba_de"]
     assert ((0.0 <= de_probabilities) & (de_probabilities <= 1.0)).all()
 
+    # Test totalVI DE
+    sp = os.path.join(save_path, "10X")
+    dataset = Dataset10X(dataset_name="pbmc_10k_protein_v3", save_path=sp)
+    n_cells = len(dataset)
+    all_indices = np.arange(n_cells)
+    vae = TOTALVI(
+        dataset.nb_genes, len(dataset.protein_names), n_batch=dataset.n_batches
+    )
+    trainer = TotalTrainer(
+        vae, dataset, train_size=0.5, use_cuda=use_cuda, early_stopping_kwargs=None
+    )
+    trainer.train(n_epochs=2)
+    post = trainer.create_posterior(
+        vae, dataset, shuffle=False, indices=all_indices, type_class=TotalPosterior
+    )
+
+    # Differential expression different models
+    idx_1 = [1, 2, 3]
+    idx_2 = [4, 5, 6, 7]
+    de_dataframe = post.differential_expression_score(
+        idx1=idx_1,
+        idx2=idx_2,
+        n_samples=10,
+        mode="vanilla",
+        use_permutation=True,
+        M_permutation=100,
+    )
+
+    de_dataframe = post.differential_expression_score(
+        idx1=idx_1,
+        idx2=idx_2,
+        n_samples=10,
+        mode="change",
+        use_permutation=True,
+        M_permutation=100,
+    )
+
 
 def test_totalvi(save_path):
     synthetic_dataset_one_batch = SyntheticDataset(n_batches=1)
     totalvi_benchmark(synthetic_dataset_one_batch, n_epochs=1, use_cuda=use_cuda)
     synthetic_dataset_two_batches = SyntheticDataset(n_batches=2)
     totalvi_benchmark(synthetic_dataset_two_batches, n_epochs=1, use_cuda=use_cuda)
+
+    # adversarial testing
+    dataset = synthetic_dataset_two_batches
+    totalvae = TOTALVI(
+        dataset.nb_genes, len(dataset.protein_names), n_batch=dataset.n_batches
+    )
+    trainer = TotalTrainer(
+        totalvae,
+        dataset,
+        train_size=0.5,
+        use_cuda=use_cuda,
+        early_stopping_kwargs=None,
+        use_adversarial_loss=True,
+    )
+    trainer.train(n_epochs=1)
 
 
 def test_autozi(save_path):
@@ -412,3 +517,15 @@ def test_deprecated_munkres():
     reward, assignment = unsupervised_clustering_accuracy(y, y_pred)
     assert reward == 1.0
     assert (assignment == np.array([[0, 3], [1, 1], [2, 2], [3, 0]])).all()
+
+
+def test_anndata_loader():
+    x = np.random.randint(low=0, high=100, size=(15, 4))
+    batch_ids = np.random.randint(low=0, high=2, size=(15,))
+    n_batches = 2
+    adata = AnnData(X=x, obs=dict(batch=batch_ids))
+    _ = AnnDatasetFromAnnData(adata, batch_label="batch")
+    dataset = AnnDatasetFromAnnData(adata, batch_label="batch")
+    assert (
+        dataset.n_batches == n_batches
+    ), "AnnDatasetFromAnnData should not modify the anndata object"

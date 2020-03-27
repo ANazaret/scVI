@@ -7,11 +7,11 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from functools import partial
 from typing import Dict, Iterable, List, Tuple, Union, Optional, Callable
-from scipy.sparse import issparse
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp_sparse
+import anndata
 import torch
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset
@@ -64,7 +64,7 @@ class GeneExpressionDataset(Dataset):
         self.cell_attribute_names = set()
         self.cell_categorical_attribute_names = set()
         self.attribute_mappings = defaultdict(list)
-        self.cell_measurements_columns = dict()
+        self.cell_measurements_col_mappings = dict()
 
         # initialize attributes
         self._X = None
@@ -94,7 +94,7 @@ class GeneExpressionDataset(Dataset):
                 "gene_attribute_names",
                 "cell_attribute_names",
                 "cell_categorical_attribute_names",
-                "cell_measurements_columns",
+                "cell_measurements_col_mappings",
             ]
             for attr_name in attrs:
                 attr = getattr(self, attr_name)
@@ -276,6 +276,7 @@ class GeneExpressionDataset(Dataset):
         gene_datasets_list: List["GeneExpressionDataset"],
         shared_labels=True,
         mapping_reference_for_sharing: Dict[str, Union[str, None]] = None,
+        cell_measurement_intersection: Dict[str, bool] = None,
     ):
         """Populates the data attribute of a GeneExpressionDataset
         from multiple ``GeneExpressionDataset`` objects, merged using the intersection
@@ -295,6 +296,9 @@ class GeneExpressionDataset(Dataset):
             remapped using index backtracking between the old and merged mapping.
             If no mapping is provided, concatenate the values and add an offset
             if the attribute is registered as categorical in the first dataset.
+        :param cell_measurement_intersection: A dictionary with keys being cell measurement attributes and values being
+            True or False. If True, that cell measurement attribute will be intersected across datasets. If False, the
+            union is taken. Defaults to intersection for each cell_measurement
         """
         logger.info("Merging datasets. Input objects are modified in place.")
         logger.info(
@@ -306,6 +310,8 @@ class GeneExpressionDataset(Dataset):
             mapping_reference_for_sharing = {}
         if shared_labels:
             mapping_reference_for_sharing.update({"labels": "cell_types"})
+        if cell_measurement_intersection is None:
+            cell_measurement_intersection = {}
 
         # get intersection based on gene_names and keep cell attributes
         # which are present in all datasets
@@ -382,7 +388,7 @@ class GeneExpressionDataset(Dataset):
                 attribute_name in gene_datasets_list[0].cell_categorical_attribute_names
             )
             is_measurement = (
-                attribute_name in gene_datasets_list[0].cell_measurements_columns
+                attribute_name in gene_datasets_list[0].cell_measurements_col_mappings
             )
             if is_categorical:
                 logger.debug(attribute_name + " was detected as categorical")
@@ -464,16 +470,32 @@ class GeneExpressionDataset(Dataset):
                     )
 
             elif is_measurement:
-                columns_attr_name = gene_datasets_list[0].cell_measurements_columns[
-                    attribute_name
-                ]
-                # Intersect columns
-                columns_to_keep = set.intersection(
-                    *[
-                        set(getattr(gene_dataset, columns_attr_name))
-                        for gene_dataset in gene_datasets_list
-                    ]
-                )
+                columns_attr_name = gene_datasets_list[
+                    0
+                ].cell_measurements_col_mappings[attribute_name]
+                intersect = cell_measurement_intersection.get(attribute_name, True)
+                # Intersect or union columns across datasets
+                # Individual datasets with missing columns will have 0s for these features
+                if intersect is True:
+                    columns_to_keep = set.intersection(
+                        *[
+                            set(getattr(gene_dataset, columns_attr_name))
+                            for gene_dataset in gene_datasets_list
+                        ]
+                    )
+                else:
+                    columns_to_keep = set.union(
+                        *[
+                            set(getattr(gene_dataset, columns_attr_name))
+                            for gene_dataset in gene_datasets_list
+                        ]
+                    )
+                    logger.info(
+                        "Taking the union for {attr}. Missing data will"
+                        " be replaced with 0. Use with care.".format(
+                            attr=attribute_name
+                        )
+                    )
                 columns_to_keep = np.asarray(list(sorted(columns_to_keep)))
                 logger.info(
                     "Keeping {n_cols} columns in {attr}".format(
@@ -482,16 +504,30 @@ class GeneExpressionDataset(Dataset):
                 )
 
                 for gene_dataset in gene_datasets_list:
-                    _, indices, _ = np.intersect1d(
+                    # Creates a template with new number of features with order defined
+                    # in columns_to_keep. Fills data in from source datasets accordingly
+                    # Source datasets are modified in place.
+                    template = np.zeros(
+                        (
+                            getattr(gene_dataset, attribute_name).shape[0],
+                            len(columns_to_keep),
+                        ),
+                        dtype=getattr(gene_dataset, attribute_name).dtype,
+                    )
+                    if type(getattr(gene_dataset, columns_attr_name)) is not np.ndarray:
+                        template = sp_sparse.lil_matrix(template)
+
+                    _, ind1, ind2 = np.intersect1d(
                         getattr(gene_dataset, columns_attr_name),
                         columns_to_keep,
                         return_indices=True,
                     )
-                    setattr(
-                        gene_dataset,
-                        attribute_name,
-                        getattr(gene_dataset, attribute_name)[:, indices],
-                    )
+                    template[:, ind2] = getattr(gene_dataset, attribute_name)[:, ind1]
+                    if type(template) is not np.ndarray:
+                        template = template.tocsr()
+                    setattr(gene_dataset, attribute_name, template)
+                    # in-place modified dataset gets column names updated to be accurate
+                    setattr(gene_dataset, columns_attr_name, columns_to_keep)
 
                 for i, gene_dataset in enumerate(gene_datasets_list):
                     attribute_values.append(getattr(gene_dataset, attribute_name))
@@ -630,10 +666,12 @@ class GeneExpressionDataset(Dataset):
 
     def initialize_cell_attribute(self, attribute_name, attribute, categorical=False):
         """Sets and registers a cell-wise attribute, e.g annotation information."""
-        if attribute_name in self.protected_attributes:
+        if (attribute_name in self.protected_attributes) or (
+            attribute_name in self.gene_attribute_names
+        ):
             valid_attribute_name = attribute_name + "_cell"
             logger.warning(
-                "{} is a protected attribute and cannot be set with this name "
+                "{} is a protected attribute or already exists as a gene attribute and cannot be set with this name "
                 "in initialize_cell_attribute, changing name to {} and setting".format(
                     attribute_name, valid_attribute_name
                 )
@@ -673,18 +711,23 @@ class GeneExpressionDataset(Dataset):
             measurement.name = valid_attribute_name
         self.initialize_cell_attribute(measurement.name, measurement.data)
         setattr(self, measurement.columns_attr_name, np.asarray(measurement.columns))
-        self.cell_measurements_columns[measurement.name] = measurement.columns_attr_name
+        self.cell_measurements_col_mappings[
+            measurement.name
+        ] = measurement.columns_attr_name
 
     def initialize_gene_attribute(self, attribute_name, attribute):
         """Sets and registers a gene-wise attribute, e.g annotation information."""
-        if attribute_name in self.protected_attributes:
+        if (attribute_name in self.protected_attributes) or (
+            attribute_name in self.cell_attribute_names
+        ):
             valid_attribute_name = attribute_name + "_gene"
             logger.warning(
-                "{} is a protected attribute and cannot be set with this name "
-                "in initialize_cell_attribute, changing name to {} and setting".format(
+                "{} is a protected attribute or already exists as a cell attribute and cannot be set with this name "
+                "in initialize_gene_attribute, changing name to {} and setting".format(
                     attribute_name, valid_attribute_name
                 )
             )
+            attribute_name = valid_attribute_name
         if not self.nb_genes == len(attribute):
             raise ValueError(
                 "Number of genes ({n_genes}) and length of gene attribute ({n_attr}) mismatch".format(
@@ -1202,6 +1245,48 @@ class GeneExpressionDataset(Dataset):
     #                           #
     #############################
 
+    def to_anndata(self) -> anndata.AnnData:
+        """
+            Converts the dataset to a anndata.AnnData object.
+            The obtained dataset can then be saved/retrieved using the anndata API.
+        """
+
+        # obs/obsm contruction
+        obsm = dict()
+        obs = dict()
+        for key in self.cell_attribute_names:
+            if key not in ["local_means", "local_vars"]:
+                vals = getattr(self, key)
+                if key in self.cell_measurements_col_mappings:
+                    obsm[key] = vals
+                elif key == "labels" and self.cell_types is not None:
+                    cell_types_arr = np.array(self.cell_types)
+                    obs["cell_types"] = cell_types_arr[vals.squeeze()]
+                else:
+                    obs[key] = vals.squeeze()
+        obs = pd.DataFrame(obs)
+
+        # var contruction
+        var = dict()
+        for key in self.gene_attribute_names:
+            if key != "gene_names":
+                var[key] = getattr(self, key)
+        gene_names = (
+            self.gene_names if self.gene_names is not None else np.arange(self.nb_genes)
+        )
+        var = pd.DataFrame(var, index=gene_names)
+
+        # It's important to save the measurements name mapping for latter loading
+        all_names = {
+            name: getattr(self, name) for name in self.cell_measurements_col_mappings
+        }
+        uns = dict(
+            cell_measurements_col_mappings=self.cell_measurements_col_mappings,
+            **all_names,
+        )
+        ad = anndata.AnnData(X=self.X, obs=obs, obsm=obsm, var=var, uns=uns)
+        return ad
+
     def normalize(self):
         scaling_factor = self.X.mean(axis=1)
         self.norm_X = self.X / scaling_factor.reshape(len(scaling_factor), 1)
@@ -1329,12 +1414,8 @@ class GeneExpressionDataset(Dataset):
         ).astype("category")
 
         counts = self.X.copy()
-        if issparse(counts):
-            counts = counts.toarray()
         adata = sc.AnnData(X=counts, obs=obs)
         batch_key = "batch" if (batch_correction and self.n_batches >= 2) else None
-        if batch_key is None:
-            del adata.obs["batch"]
         if flavor != "seurat_v3":
             if flavor == "seurat_v2":
                 # name expected by scanpy
@@ -1362,71 +1443,107 @@ class GeneExpressionDataset(Dataset):
 
         return adata.var
 
+    def get_batch_mask_cell_measurement(self, attribute_name: str):
+        """Returns a list with length number of batches where each entry is a mask over present
+        cell measurement columns
 
-def seurat_v3_highly_variable_genes(adata, n_top_genes: int = 4000):
+        :param attribute_name: cell_measurement attribute name
+
+        :return: List of ``np.ndarray`` containing, for each batch, a mask of which columns were
+        actually measured in that batch. This is useful when taking the union of a cell measurement
+        over datasets.
+        """
+        batch_mask = []
+        for b in np.unique(self.batch_indices.ravel()):
+            batch_sum = getattr(self, attribute_name)[
+                np.where(self.batch_indices.ravel() == b)[0], :
+            ].sum(axis=0)
+            all_zero = batch_sum == 0
+            batch_mask.append(~all_zero)
+
+        return batch_mask
+
+
+def seurat_v3_highly_variable_genes(
+    adata, n_top_genes: int = 4000, batch_key: str = "batch"
+):
     """ An adapted implementation of the "vst" feature selection in Seurat v3.
 
         The major differences are that we use lowess insted of loess and when considering
         a dataset with multiple batches we rank features by their median normalized variance
         across batches
 
+        For further details of the arithmetic see https://www.overleaf.com/read/ckptrbgzzzpg
+
         :param n_top_genes: How many variable genes to return
+        :param batch_key: key in adata.obs that contains batch info. If None, do not use batch info
 
     """
 
     from scanpy.preprocessing._utils import _get_mean_var
     from scanpy.preprocessing._distributed import materialize_as_ndarray
 
+    lowess = sm.nonparametric.lowess
+
+    if batch_key is None:
+        adata.obs[batch_key] = np.zeros((adata.X.shape[0]))
+
     norm_gene_vars = []
-    del_batch = False
-    if "batch" not in adata.obs_keys():
-        del_batch = True
-        adata.obs["batch"] = np.zeros((adata.X.shape[0]))
-    for b in np.unique(adata.obs["batch"]):
-        lowess = sm.nonparametric.lowess
+    for b in np.unique(adata.obs[batch_key]):
 
         mean, var = materialize_as_ndarray(
-            _get_mean_var(adata[adata.obs["batch"] == b].X)
+            _get_mean_var(adata[adata.obs[batch_key] == b].X)
         )
-
-        if sum(mean == 0) > 0:
-            raise ValueError(
-                "Some genes are all zero in batch {batch}, please ensure genes"
-                " are non-zero in each batch separately. "
-                " by running dataset.filter_genes_by_count(per_batch=True)".format(
-                    batch=b
-                )
-            )
-
+        not_const = var > 0
         estimat_var = np.zeros((adata.X.shape[1]))
 
-        y = np.log10(var)
-        x = np.log10(mean)
+        y = np.log10(var[not_const])
+        x = np.log10(mean[not_const])
         # output is sorted by x
         v = lowess(y, x, frac=0.15)
-        estimat_var[np.argsort(x)] = v[:, 1]
+        estimat_var[not_const][np.argsort(x)] = v[:, 1]
 
-        norm_values = (adata.X - mean) / np.sqrt(10 ** estimat_var)
-        # as in seurat paper, clip max values
-        norm_values = np.clip(
-            norm_values, None, np.sqrt(np.sum(adata.obs["batch"] == b))
+        # get normalized variance
+        reg_std = np.sqrt(10 ** estimat_var)
+        batch_counts = adata[adata.obs[batch_key] == b].X.copy()
+        # clip large values as in Seurat
+        N = np.sum(adata.obs["batch"] == b)
+        vmax = np.sqrt(N)
+        clip_val = reg_std * vmax + mean
+        # could be something faster here
+        for g in range(batch_counts.shape[1]):
+            batch_counts[:, g][batch_counts[:, g] > vmax] = clip_val[g]
+
+        if sp_sparse.issparse(batch_counts):
+            squared_batch_counts_sum = np.array(batch_counts.power(2).sum(axis=0))
+            batch_counts_sum = np.array(batch_counts.sum(axis=0))
+        else:
+            squared_batch_counts_sum = np.square(batch_counts).sum(axis=0)
+            batch_counts_sum = batch_counts.sum(axis=0)
+
+        norm_gene_var = (1 / ((N - 1) * np.square(reg_std))) * (
+            (N * np.square(mean))
+            + squared_batch_counts_sum
+            - 2 * batch_counts_sum * mean
         )
-        norm_gene_var = norm_values.var(0)
         norm_gene_vars.append(norm_gene_var.reshape(1, -1))
 
     norm_gene_vars = np.concatenate(norm_gene_vars, axis=0)
-    ranked_norm_gene_vars = np.argsort(norm_gene_vars, axis=1)
+    # argsort twice gives ranks
+    ranked_norm_gene_vars = np.argsort(np.argsort(norm_gene_vars, axis=1), axis=1)
     median_norm_gene_vars = np.median(norm_gene_vars, axis=0)
+    median_ranked = np.median(ranked_norm_gene_vars, axis=0)
 
     num_batches_high_var = np.sum(
         ranked_norm_gene_vars >= (adata.X.shape[1] - n_top_genes), axis=0
     )
     df = pd.DataFrame(index=np.array(adata.var_names))
     df["highly_variable_n_batches"] = num_batches_high_var
+    df["highly_variable_median_rank"] = median_ranked
 
     df["highly_variable_median_variance"] = median_norm_gene_vars
     df.sort_values(
-        ["highly_variable_median_variance"],
+        ["highly_variable_n_batches", "highly_variable_median_rank"],
         ascending=False,
         na_position="last",
         inplace=True,
@@ -1434,9 +1551,6 @@ def seurat_v3_highly_variable_genes(adata, n_top_genes: int = 4000):
     df["highly_variable"] = False
     df.loc[:n_top_genes, "highly_variable"] = True
     df = df.loc[adata.var_names]
-
-    if del_batch is True:
-        del adata.obs["batch"]
 
     adata.var["highly_variable"] = df["highly_variable"].values
     adata.var["highly_variable_n_batches"] = df["highly_variable_n_batches"].values
